@@ -38,7 +38,8 @@ var factory = new ConnectionFactory()
     ClientProvidedName = "CONSUMER",
     Port = port,
     AutomaticRecoveryEnabled = true,
-    TopologyRecoveryEnabled = true
+    TopologyRecoveryEnabled = true,
+    DispatchConsumersAsync = true
 };
 
 var endpoints = new List<AmqpTcpEndpoint>
@@ -51,31 +52,30 @@ var endpoints = new List<AmqpTcpEndpoint>
 bool connected = false;
 IConnection? connection = null;
 
-void Connect()
+async Task Connect()
 {
     while (!connected)
     {
         try
         {
-            connection = factory.CreateConnection(endpoints);
+            connection = await factory.CreateConnectionAsync(endpoints);
             connected = true;
         }
         catch (BrokerUnreachableException)
         {
             connected = false;
             Console.WriteLine("[INFO] CONSUMER: waiting 5 seconds to re-try connection!");
-            Thread.Sleep(TimeSpan.FromSeconds(5));
+            await Task.Delay(TimeSpan.FromSeconds(5));
         }
     }
 }
 
 int message_count = 0;
 
-void Consume()
+async Task Consume()
 {
     var latchSpan = TimeSpan.FromSeconds(5);
     bool maybeExit = false;
-    var autorecoveringConnection = connection as IAutorecoveringConnection;
 
     try
     {
@@ -87,14 +87,11 @@ void Consume()
             }
             else
             {
-                if (autorecoveringConnection is not null)
+                connection.RecoverySucceeded += (s, ea) =>
                 {
-                    autorecoveringConnection.RecoverySucceeded += (s, ea) =>
-                    {
-                        Console.WriteLine("[INFO] CONSUMER: connection recovery succeeded!");
-                        maybeExit = false;
-                    };
-                }
+                    Console.WriteLine("[INFO] CONSUMER: connection recovery succeeded!");
+                    maybeExit = false;
+                };
 
                 connection.CallbackException += (s, ea) =>
                 {
@@ -120,7 +117,7 @@ void Consume()
                     maybeExit = true;
                 };
 
-                using (var channel = connection.CreateModel())
+                using (var channel = await connection.CreateChannelAsync())
                 {
                     channel.CallbackException += (s, ea) =>
                     {
@@ -128,39 +125,39 @@ void Consume()
                         Console.Error.WriteLine($"[ERROR] CONSUMER: channel.CallbackException: {cea}");
                     };
 
-                    channel.ModelShutdown += (s, ea) =>
+                    channel.ChannelShutdown += (s, ea) =>
                     {
                         var sdea = (ShutdownEventArgs)ea;
-                        Console.Error.WriteLine($"[WARNING] CONSUMER: channel.ModelShutdown: {sdea}");
+                        Console.Error.WriteLine($"[WARNING] CONSUMER: channel.ChannelShutdown: {sdea}");
                         maybeExit = true;
                     };
 
-                    channel.ExchangeDeclare(exchange: exchangeName, type: ExchangeType.Topic, durable: true);
+                    await channel.ExchangeDeclareAsync(exchange: exchangeName, type: ExchangeType.Topic, durable: true);
 
                     var queueArgs = new Dictionary<string, object>
                     {
                         { "x-queue-type", "quorum" }
                     };
-                    var queueDeclareResult = channel.QueueDeclare(queue: queueName, durable: true,
+                    var queueDeclareResult = await channel.QueueDeclareAsync(queue: queueName, durable: true,
                             exclusive: false, autoDelete: false, arguments: queueArgs);
                     Debug.Assert(queueName == queueDeclareResult.QueueName);
 
-                    channel.QueueBind(queue: queueName, exchange: exchangeName, routingKey: "update.*");
+                    await channel.QueueBindAsync(queue: queueName, exchange: exchangeName, routingKey: "update.*");
 
-                    channel.BasicQos(0, 1, false);
+                    await channel.BasicQosAsync(0, 1, false);
 
                     Console.WriteLine("[INFO] CONSUMER: waiting for messages...");
 
-                    var consumer = new EventingBasicConsumer(channel);
-                    consumer.Received += (model, ea) =>
+                    var consumer = new AsyncEventingBasicConsumer(channel);
+                    consumer.Received += async (model, ea) =>
                     {
                         DateTime received = DateTime.Now;
                         string receivedText = received.ToString("MM/dd/yyyy HH:mm:ss.ffffff");
                         Console.WriteLine($"[INFO] CONSUMER received at {receivedText}, size {ea.Body.Length}, message_count: {message_count++}");
-                        channel.BasicAck(deliveryTag: ea.DeliveryTag, multiple: false);
+                        await channel.BasicAckAsync(deliveryTag: ea.DeliveryTag, multiple: false);
                     };
 
-                    channel.BasicConsume(queue: queueName, autoAck: false, consumer: consumer);
+                    await channel.BasicConsumeAsync(queue: queueName, autoAck: false, consumer: consumer);
 
                     int maybeExitTries = 0;
                     while (false == latch.WaitOne(latchSpan))
@@ -201,8 +198,8 @@ void Consume()
 
 do
 {
-    Connect();
-    Consume();
+    await Connect();
+    await Consume();
     connected = false;
     connection = null;
 } while (running);

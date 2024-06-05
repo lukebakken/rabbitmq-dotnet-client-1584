@@ -51,29 +51,28 @@ var endpoints = new List<AmqpTcpEndpoint>
 bool connected = false;
 IConnection? connection = null;
 
-void Connect()
+async Task Connect()
 {
     while (!connected)
     {
         try
         {
-            connection = factory.CreateConnection(endpoints);
+            connection = await factory.CreateConnectionAsync(endpoints);
             connected = true;
         }
         catch (BrokerUnreachableException)
         {
             connected = false;
             Console.WriteLine("[INFO] PRODUCER: waiting 5 seconds to re-try connection!");
-            Thread.Sleep(TimeSpan.FromSeconds(5));
+            await Task.Delay(TimeSpan.FromSeconds(5));
         }
     }
 }
 
-void Publish()
+async Task Publish()
 {
     var latchSpan = TimeSpan.FromSeconds(1);
     bool maybeExit = false;
-    var autorecoveringConnection = connection as IAutorecoveringConnection;
 
     try
     {
@@ -88,14 +87,11 @@ void Publish()
             }
             else
             {
-                if (autorecoveringConnection is not null)
+                connection.RecoverySucceeded += (s, ea) =>
                 {
-                    autorecoveringConnection.RecoverySucceeded += (s, ea) =>
-                    {
-                        Console.WriteLine("[INFO] PRODUCER: connection recovery succeeded!");
-                        maybeExit = false;
-                    };
-                }
+                    Console.WriteLine("[INFO] PRODUCER: connection recovery succeeded!");
+                    maybeExit = false;
+                };
 
                 connection.CallbackException += (s, ea) =>
                 {
@@ -122,7 +118,7 @@ void Publish()
                 };
 
 
-                using (var channel = connection.CreateModel())
+                using (var channel = await connection.CreateChannelAsync())
                 {
                     channel.CallbackException += (s, ea) =>
                     {
@@ -130,28 +126,29 @@ void Publish()
                         Console.Error.WriteLine($"[ERROR] PRODUCER: channel.CallbackException: {cea}");
                     };
 
-                    channel.ModelShutdown += (s, ea) =>
+                    channel.ChannelShutdown += (s, ea) =>
                     {
                         var sdea = (ShutdownEventArgs)ea;
-                        Console.Error.WriteLine($"[WARNING] PRODUCER: channel.ModelShutdown: {sdea}");
+                        Console.Error.WriteLine($"[WARNING] PRODUCER: channel.ChannelShutdown: {sdea}");
                         maybeExit = true;
                     };
 
-                    channel.ExchangeDeclare(exchange: exchangeName, type: ExchangeType.Topic, durable: true);
+                    await channel.ExchangeDeclareAsync(exchange: exchangeName, type: ExchangeType.Topic, durable: true);
 
                     var args = new Dictionary<string, object>
                     {
                         { "x-queue-type", "quorum" }
                     };
-                    var queueDeclareResult = channel.QueueDeclare(queue: queueName, durable: true,
+                    var queueDeclareResult = await channel.QueueDeclareAsync(queue: queueName, durable: true,
                             exclusive: false, autoDelete: false, arguments: args);
                     Debug.Assert(queueName == queueDeclareResult.QueueName);
 
-                    channel.QueueBind(queue: queueName, exchange: exchangeName, routingKey: "update.*");
+                    await channel.QueueBindAsync(queue: queueName, exchange: exchangeName, routingKey: "update.*");
 
-                    channel.ConfirmSelect();
+                    await channel.ConfirmSelectAsync();
 
                     int maybeExitTries = 0;
+                    var props = new BasicProperties();
                     while (false == latch.WaitOne(latchSpan))
                     {
                         if (false == maybeExit && true == connection.IsOpen)
@@ -162,9 +159,9 @@ void Publish()
                             string routingKey = string.Format("update.{0}", Guid.NewGuid().ToString());
                             try
                             {
-                                channel.BasicPublish(exchange: exchangeName, routingKey: routingKey,
-                                        basicProperties: null, body: buffer, mandatory: true);
-                                channel.WaitForConfirmsOrDie();
+                                await channel.BasicPublishAsync(exchange: exchangeName, routingKey: routingKey,
+                                        basicProperties: props, body: buffer, mandatory: true);
+                                await channel.WaitForConfirmsOrDieAsync();
                                 Console.WriteLine($"[INFO] PRODUCER sent message at {now}");
                             }
                             catch (AlreadyClosedException ex)
@@ -202,8 +199,8 @@ void Publish()
 
 do
 {
-    Connect();
-    Publish();
+    await Connect();
+    await Publish();
     connected = false;
     connection = null;
 } while (running);
