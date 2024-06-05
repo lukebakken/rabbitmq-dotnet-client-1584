@@ -7,10 +7,7 @@ using RabbitMQ.Client.Exceptions;
 const string exchangeName = "rmq-dotnet-client-1584-exchange";
 const string queueName = "rmq-dotnet-client-1584";
 
-const string hostName0 = "rmq0.local";
-const string hostName1 = "rmq1.local";
-const string hostName2 = "rmq2.local";
-
+const string hostName = "haproxy.local";
 const ushort port = 5672;
 
 AutoResetEvent latch = new AutoResetEvent(false);
@@ -36,16 +33,10 @@ if (latch.WaitOne(TimeSpan.FromSeconds(10)))
 var factory = new ConnectionFactory()
 {
     ClientProvidedName = "PRODUCER",
+    HostName = hostName,
     Port = port,
     AutomaticRecoveryEnabled = true,
     TopologyRecoveryEnabled = true
-};
-
-var endpoints = new List<AmqpTcpEndpoint>
-{
-    new AmqpTcpEndpoint(hostName0, port),
-    new AmqpTcpEndpoint(hostName1, port),
-    new AmqpTcpEndpoint(hostName2, port),
 };
 
 bool connected = false;
@@ -57,7 +48,7 @@ void Connect()
     {
         try
         {
-            connection = factory.CreateConnection(endpoints);
+            connection = factory.CreateConnection();
             connected = true;
         }
         catch (BrokerUnreachableException)
