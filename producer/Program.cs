@@ -13,21 +13,43 @@ const string hostName2 = "rmq2.local";
 
 const ushort port = 5672;
 
-AutoResetEvent latch = new AutoResetEvent(false);
-bool running = true;
+var tcs = new TaskCompletionSource();
+var cts = new CancellationTokenSource();
+cts.Token.Register(tcs.SetCanceled);
+bool sigintReceived = false;
 
 void CancelHandler(object? sender, ConsoleCancelEventArgs e)
 {
     Console.WriteLine("[INFO] CTRL-C pressed, exiting!");
     e.Cancel = true;
-    running = false;
-    latch.Set();
+    sigintReceived = true;
+    cts.Cancel();
 }
 
 Console.CancelKeyPress += new ConsoleCancelEventHandler(CancelHandler);
 
+AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+{
+    if (false == sigintReceived)
+    {
+        Console.WriteLine("[INFO] Received SIGTERM");
+        cts.Cancel();
+    }
+    else
+    {
+        Console.WriteLine("[INFO] Received SIGTERM, ignoring it because already processed SIGINT");
+    }
+};
+
 Console.WriteLine("[INFO] PRODUCER: waiting 10 seconds to try initial connection to RabbitMQ");
-if (latch.WaitOne(TimeSpan.FromSeconds(10)))
+try
+{
+    await tcs.Task.WaitAsync(TimeSpan.FromSeconds(10));
+}
+catch (TimeoutException)
+{
+}
+catch (OperationCanceledException)
 {
     Console.WriteLine("[INFO] PRODUCER EXITING");
     Environment.Exit(0);
@@ -69,7 +91,7 @@ async Task Connect()
     }
 }
 
-async Task Publish()
+async Task<bool> Publish()
 {
     var latchSpan = TimeSpan.FromSeconds(1);
     bool maybeExit = false;
@@ -149,8 +171,20 @@ async Task Publish()
 
                     int maybeExitTries = 0;
                     var props = new BasicProperties();
-                    while (false == latch.WaitOne(latchSpan))
+                    while (false == cts.IsCancellationRequested)
                     {
+                        try
+                        {
+                            await tcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+                        }
+                        catch (TimeoutException)
+                        {
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
+
                         if (false == maybeExit && true == connection.IsOpen)
                         {
                             maybeExitTries = 0;
@@ -160,8 +194,9 @@ async Task Publish()
                             try
                             {
                                 await channel.BasicPublishAsync(exchange: exchangeName, routingKey: routingKey,
-                                        basicProperties: props, body: buffer, mandatory: true);
-                                await channel.WaitForConfirmsOrDieAsync();
+                                        basicProperties: props, body: buffer, mandatory: true,
+                                        cancellationToken: cts.Token);
+                                await channel.WaitForConfirmsOrDieAsync(cancellationToken: cts.Token);
                                 Console.WriteLine($"[INFO] PRODUCER sent message at {now}");
                             }
                             catch (AlreadyClosedException ex)
@@ -181,7 +216,7 @@ async Task Publish()
                             if (maybeExitTries > 60)
                             {
                                 Console.Error.WriteLine($"[ERROR] PRODUCER could not auto-recover connection within 60 seconds, re-connecting!");
-                                break;
+                                return true;
                             }
                         }
                     }
@@ -194,13 +229,17 @@ async Task Publish()
     catch (Exception ex)
     {
         Console.Error.WriteLine($"[ERROR] PRODUCER exception: {ex}");
+        return false;
     }
+
+    return true;
 }
 
+bool shouldReconnect = true;
 do
 {
     await Connect();
-    await Publish();
+    shouldReconnect = await Publish();
     connected = false;
     connection = null;
-} while (running);
+} while (shouldReconnect && false == cts.IsCancellationRequested);
